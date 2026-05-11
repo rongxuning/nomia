@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: nomia
+      POSTGRES_PASSWORD: nomia
+      POSTGRES_DB: nomia
+    ports:
+      - "5432:5432"
+    volumes:
+      - nomia_pgdata:/var/lib/postgresql/data
+
+volumes:
+  nomia_pgdata:
+

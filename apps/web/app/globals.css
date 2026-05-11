@@ -1,0 +1,17 @@
+@config "../tailwind.config.js";
+@import "tailwindcss";
+
+html,
+body {
+  height: 100%;
+}
+
+.dot-grid {
+  background-image: radial-gradient(circle, #e4e1ed 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.material-symbols-outlined {
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
+}
+

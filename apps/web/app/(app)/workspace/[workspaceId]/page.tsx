@@ -1,0 +1,622 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams, useRouter } from "next/navigation";
+import { apiFetch } from "@/lib/api";
+import { getToken } from "@/lib/auth";
+import { TaskDrawerWithComments } from "@/components/TaskDrawerWithComments";
+
+const RECENT_DISCUSSIONS_PAGE_SIZE = 20;
+
+type Workspace = {
+  id: string;
+  name: string;
+  description?: string | null;
+  created_at?: string | null;
+  created_by_display_name?: string | null;
+};
+type Member = { id: string; user_id: string; email: string; display_name: string; role: string; status: string };
+type Project = {
+  id: string;
+  name: string;
+  description?: string | null;
+  archived: boolean;
+  todo_doing?: number;
+  done_archived?: number;
+};
+type WorkspaceStats = {
+  project_count: number;
+  total_task_count: number;
+  todo_count: number;
+  doing_count: number;
+  high_priority_count: number;
+};
+
+type RecentDiscussion = {
+  id: string;
+  body: string;
+  created_at: string;
+  author_display_name: string;
+  is_reply: boolean;
+  project_id: string;
+  project_name: string;
+  item_id: string;
+  item_title: string;
+};
+
+function pad2(n: number) {
+  return String(n).padStart(2, "0");
+}
+
+function formatYmdHm(iso: string) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/** 评论/回复列表：精确时间 */
+function formatDiscussionExact(iso: string) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** 距今描述：7 天及以上固定为「一周前」 */
+function formatDiscussionAgo(iso: string) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const ms = Date.now() - d.getTime();
+  if (ms < 0) return "刚刚";
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days} 天前`;
+  return "一周前";
+}
+
+export default function WorkspaceHome() {
+  const router = useRouter();
+  const params = useParams<{ workspaceId: string }>();
+  const workspaceId = params.workspaceId;
+
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [members, setMembers] = useState<Member[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [stats, setStats] = useState<WorkspaceStats | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const token = useMemo(() => getToken(), []);
+  const [deleteProjectOpen, setDeleteProjectOpen] = useState(false);
+  const [deleteProjectTarget, setDeleteProjectTarget] = useState<Project | null>(null);
+  const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
+  const [deleteProjectError, setDeleteProjectError] = useState<string | null>(null);
+  const [recentDiscussions, setRecentDiscussions] = useState<RecentDiscussion[]>([]);
+  const [discussionsLoading, setDiscussionsLoading] = useState(false);
+  const [discussionsError, setDiscussionsError] = useState<string | null>(null);
+  const [discussionsHasMore, setDiscussionsHasMore] = useState(true);
+  const discussionsSentinelRef = useRef<HTMLDivElement | null>(null);
+  const discussionsRequestSeqRef = useRef(0);
+  const discussionsLoadingRef = useRef(false);
+  const [taskDrawerOpen, setTaskDrawerOpen] = useState(false);
+  const [taskDrawerProjectId, setTaskDrawerProjectId] = useState<string | null>(null);
+  const [taskDrawerItemId, setTaskDrawerItemId] = useState<string | null>(null);
+  const [taskDrawerHighlightId, setTaskDrawerHighlightId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) {
+      router.push("/login");
+      return;
+    }
+    setError(null);
+    Promise.all([
+      apiFetch<Workspace>(`/workspaces/${workspaceId}`, { token }),
+      apiFetch<Member[]>(`/workspaces/${workspaceId}/members`, { token }).catch(() => [] as Member[]),
+      apiFetch<Project[]>(`/workspaces/${workspaceId}/projects`, { token }).catch(() => [] as Project[]),
+      apiFetch<WorkspaceStats>(`/workspaces/${workspaceId}/stats`, { token }).catch(() => null as any),
+      apiFetch<Record<string, { todo_doing: number; done_archived: number }>>(
+        `/workspaces/${workspaceId}/projects/progress`,
+        { token },
+      ).catch(() => ({})),
+    ])
+      .then(([w, m, p, s, progress]) => {
+        setWorkspace(w);
+        setMembers(m);
+        const prog = progress as Record<string, { todo_doing: number; done_archived: number }>;
+        setProjects(
+          p.filter((x) => !x.archived).map((proj) => ({
+            ...proj,
+            todo_doing: prog[proj.id]?.todo_doing ?? 0,
+            done_archived: prog[proj.id]?.done_archived ?? 0,
+          })),
+        );
+        setStats(s);
+      })
+      .catch((e: any) => setError(e?.message ?? "加载失败"));
+  }, [router, token, workspaceId]);
+
+  const loadMoreDiscussions = useCallback(
+    async (reset = false) => {
+      if (!token) return;
+      if (discussionsLoadingRef.current) return;
+      if (!reset && !discussionsHasMore) return;
+
+      const seq = ++discussionsRequestSeqRef.current;
+      discussionsLoadingRef.current = true;
+      setDiscussionsLoading(true);
+      setDiscussionsError(null);
+      try {
+        const offset = reset ? 0 : recentDiscussions.length;
+        const list = await apiFetch<RecentDiscussion[]>(
+          `/workspaces/${workspaceId}/recent-discussions?limit=${RECENT_DISCUSSIONS_PAGE_SIZE}&offset=${offset}`,
+          { token },
+        );
+        if (seq !== discussionsRequestSeqRef.current) return;
+        setRecentDiscussions((prev) => {
+          if (reset) return list;
+          const seen = new Set(prev.map((x) => x.id));
+          const fresh = list.filter((x) => !seen.has(x.id));
+          return [...prev, ...fresh];
+        });
+        setDiscussionsHasMore(list.length === RECENT_DISCUSSIONS_PAGE_SIZE);
+      } catch (e: any) {
+        if (seq !== discussionsRequestSeqRef.current) return;
+        setDiscussionsError(e?.message ?? "加载失败");
+      } finally {
+        if (seq === discussionsRequestSeqRef.current) {
+          discussionsLoadingRef.current = false;
+          setDiscussionsLoading(false);
+        }
+      }
+    },
+    [token, workspaceId, recentDiscussions.length, discussionsHasMore],
+  );
+
+  useEffect(() => {
+    if (!token) return;
+    setRecentDiscussions([]);
+    setDiscussionsHasMore(true);
+    setDiscussionsError(null);
+    discussionsRequestSeqRef.current++;
+    discussionsLoadingRef.current = false;
+    void loadMoreDiscussions(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, workspaceId]);
+
+  useEffect(() => {
+    if (!discussionsHasMore) return;
+    const node = discussionsSentinelRef.current;
+    if (!node) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            void loadMoreDiscussions(false);
+            break;
+          }
+        }
+      },
+      { rootMargin: "200px 0px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [discussionsHasMore, loadMoreDiscussions]);
+
+  async function onDeleteProject(project: Project) {
+    if (!token) {
+      router.push("/login");
+      return;
+    }
+    setDeleteProjectError(null);
+    setDeletingProjectId(project.id);
+    try {
+      await apiFetch<void>(`/workspaces/${workspaceId}/projects/${project.id}`, { method: "DELETE", token });
+      setProjects((prev) => prev.filter((p) => p.id !== project.id));
+      setDeleteProjectOpen(false);
+      setDeleteProjectTarget(null);
+    } catch (e: any) {
+      setDeleteProjectError(e?.message ?? "删除失败");
+    } finally {
+      setDeletingProjectId(null);
+    }
+  }
+
+  const activeMembers = members.filter((m) => m.status === "active");
+  const adminMembers = activeMembers.filter((m) => m.role === "owner" || m.role === "admin");
+  const contributorMembers = activeMembers.filter((m) => m.role === "member" || m.role === "guest");
+  const memberPreview = activeMembers.slice(0, 3);
+  const remainingMemberCount = Math.max(0, activeMembers.length - memberPreview.length);
+
+  return (
+    <main className="pt-4 pb-12 px-container-padding">
+      <div className="max-w-container-max mx-auto space-y-3xl">
+        <section className="flex flex-col md:flex-row md:items-end justify-between gap-lg">
+          <div />
+          <div />
+        </section>
+
+        {error && (
+          <div className="rounded-xl border border-error-container bg-error-container/10 p-4 text-small text-error">
+            {error}
+          </div>
+        )}
+
+        <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-[2fr_2.5fr_1.5fr_2fr_2fr] gap-gutter">
+          <div className="p-xl bg-white rounded-xl border border-border-subtle flex flex-col justify-between h-40 hover:shadow-lg transition-all">
+            <span className="text-overline text-zinc-400">工作空间</span>
+            <div className="space-y-1">
+              <div className="font-subhead text-lg text-text-primary truncate">{workspace?.name ?? "—"}</div>
+              <div className="text-small text-text-secondary truncate">{workspace?.description || "暂无描述。"}</div>
+              <div className="text-caption text-neutral-muted">
+                创建于 {workspace?.created_at ? formatYmdHm(workspace.created_at) : "—"}
+              </div>
+              <div className="text-caption text-neutral-muted">
+                创建者 {workspace?.created_by_display_name ?? "—"}
+              </div>
+            </div>
+          </div>
+
+          <div className="p-xl bg-white rounded-xl border border-border-subtle flex flex-col justify-between h-40 hover:shadow-lg transition-all">
+            <span className="text-overline text-zinc-400">成员</span>
+            <div className="space-y-2 mt-1.5">
+              {/* Row 1: Total */}
+              <div className="flex items-baseline gap-2">
+                <span className="font-headline text-section-heading">{activeMembers.length}</span>
+                <span className="text-text-secondary text-caption">总计</span>
+              </div>
+
+              {/* Row 2: Admin count + members */}
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-caption text-neutral-muted">管理员 {adminMembers.length}</div>
+                <div className="flex -space-x-2">
+                  {adminMembers.slice(0, 3).map((m) => (
+                    <div
+                      key={m.id}
+                      className="w-8 h-8 rounded-full border-2 border-white bg-surface-container flex items-center justify-center text-[10px] font-bold text-on-surface-variant"
+                      title={m.display_name || m.email}
+                    >
+                      {(m.display_name?.trim().slice(0, 1) || m.email.trim().slice(0, 1)).toUpperCase()}
+                    </div>
+                  ))}
+                  {adminMembers.length > 3 && (
+                    <div className="w-8 h-8 rounded-full border-2 border-white bg-gray-100 flex items-center justify-center text-[10px] font-bold text-gray-500">
+                      +{adminMembers.length - 3}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Row 3: Contributor count + members */}
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-caption text-neutral-muted">贡献者 {contributorMembers.length}</div>
+                <div className="flex -space-x-2">
+                  {contributorMembers.slice(0, 3).map((m) => (
+                    <div
+                      key={m.id}
+                      className="w-8 h-8 rounded-full border-2 border-white bg-surface-container flex items-center justify-center text-[10px] font-bold text-on-surface-variant"
+                      title={m.display_name || m.email}
+                    >
+                      {(m.display_name?.trim().slice(0, 1) || m.email.trim().slice(0, 1)).toUpperCase()}
+                    </div>
+                  ))}
+                  {contributorMembers.length > 3 && (
+                    <div className="w-8 h-8 rounded-full border-2 border-white bg-gray-100 flex items-center justify-center text-[10px] font-bold text-gray-500">
+                      +{contributorMembers.length - 3}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-xl bg-white rounded-xl border border-border-subtle flex flex-col justify-between h-40 hover:shadow-lg transition-all">
+            <span className="text-overline text-zinc-400">项目数量</span>
+            <div className="flex items-baseline gap-2">
+              <span className="font-headline text-section-heading">{stats?.project_count ?? projects.length}</span>
+              <span className="text-text-secondary text-caption">个项目</span>
+            </div>
+          </div>
+
+          <div className="p-xl bg-white rounded-xl border border-border-subtle flex flex-col justify-between h-40 hover:shadow-lg transition-all">
+            <span className="text-overline text-zinc-400">项目健康度</span>
+            <div className="space-y-3 mt-1.5">
+              <div className="flex items-baseline gap-2">
+                <span className="font-headline text-section-heading">
+                  {stats?.total_task_count
+                    ? `${Math.round((((stats.todo_count ?? 0) + (stats.doing_count ?? 0)) / stats.total_task_count) * 100)}%`
+                    : "—"}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-3 gap-3">
+              <div className="space-y-1">
+                <div className="text-caption text-neutral-muted">待办</div>
+                <div className="font-bold text-lg text-text-primary">{stats?.todo_count ?? 0}</div>
+              </div>
+              <div className="space-y-1">
+                <div className="text-caption text-neutral-muted">进行中</div>
+                <div className="font-bold text-lg text-text-primary">{stats?.doing_count ?? 0}</div>
+              </div>
+              <div className="space-y-1">
+                <div className="text-caption text-neutral-muted">高优先级</div>
+                <div className="font-bold text-lg text-text-primary">{stats?.high_priority_count ?? 0}</div>
+              </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-xl bg-white rounded-xl border border-border-subtle flex flex-col justify-between h-40 hover:shadow-lg transition-all">
+            <span className="text-overline text-zinc-400">工作空间设置</span>
+            <div className="grid grid-cols-1 gap-sm">
+              <a
+                className="w-full px-lg py-sm rounded-xl border border-zinc-200 text-sm font-medium text-text-primary hover:bg-zinc-50 transition-all flex items-center justify-center gap-2"
+                href={`/workspace/${workspaceId}/members`}
+              >
+                <span className="material-symbols-outlined text-lg">person_add</span>
+                添加成员
+              </a>
+              <a
+                className="w-full px-lg py-sm rounded-xl bg-primary text-white text-sm font-semibold hover:bg-primary-hover shadow-indigo-100 shadow-lg hover:-translate-y-0.5 transition-all flex items-center justify-center gap-2"
+                href={`/workspace/${workspaceId}/projects`}
+              >
+                <span className="material-symbols-outlined text-lg">add</span>
+                新建项目
+              </a>
+            </div>
+          </div>
+        </section>
+
+        <section className="space-y-lg">
+          <div className="flex items-center justify-between">
+            <h2 className="font-subhead text-subhead text-text-primary">进行中的项目</h2>
+            <div className="flex items-center gap-sm">
+              <span className="text-small text-zinc-500">排序：</span>
+              <button className="text-small font-semibold flex items-center gap-1" type="button">
+                最近更新 <span className="material-symbols-outlined text-sm">expand_more</span>
+              </button>
+            </div>
+          </div>
+
+          {projects.length === 0 ? (
+            <div className="bg-white rounded-xl border border-border-subtle p-xl text-small text-text-secondary">
+              暂无项目。创建第一个项目即可开始。
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-gutter">
+              {projects.slice(0, 4).map((p) => (
+                <a
+                  key={p.id}
+                  href={`/workspace/${workspaceId}/projects/${p.id}`}
+                  className="bg-white rounded-xl border border-border-subtle overflow-hidden hover:shadow-xl transition-all group relative"
+                >
+                  <div className="p-xl space-y-lg">
+                    <div className="flex justify-between items-start">
+                      <div className="space-y-xs">
+                        <h3 className="font-subhead text-xl text-text-primary group-hover:text-primary transition-colors">
+                          {p.name}
+                        </h3>
+                        <p className="text-body text-text-secondary text-sm">
+                          {p.description || "暂无描述。"}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-sm">
+                        <button
+                          type="button"
+                          className="w-10 h-10 flex items-center justify-center border border-border-subtle rounded-xl bg-white/90 hover:bg-red-50 transition-colors group/delete disabled:opacity-50 disabled:cursor-not-allowed"
+                          title="删除项目"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setDeleteProjectError(null);
+                            setDeleteProjectTarget(p);
+                            setDeleteProjectOpen(true);
+                          }}
+                          disabled={deletingProjectId === p.id}
+                        >
+                          <span className="material-symbols-outlined text-[18px] text-gray-400 group-hover/delete:text-red-600">
+                            delete
+                          </span>
+                        </button>
+                        <span className="bg-indigo-50 text-indigo-600 px-3 py-1 rounded-full text-overline">进行中</span>
+                      </div>
+                    </div>
+
+                    <div className="space-y-sm">
+                      <div className="flex justify-between text-caption">
+                        <span className="text-zinc-500">项目进度</span>
+                        <span className="font-bold text-primary">
+                          {(p.done_archived ?? 0)}/{(p.todo_doing ?? 0) + (p.done_archived ?? 0)}
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full bg-zinc-100 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-primary rounded-full"
+                          style={{
+                            width: `${
+                              (p.todo_doing ?? 0) + (p.done_archived ?? 0) === 0
+                                ? 0
+                                : Math.round(((p.done_archived ?? 0) / ((p.todo_doing ?? 0) + (p.done_archived ?? 0))) * 100)
+                            }%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </a>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="grid grid-cols-1 gap-gutter">
+          <div className="bg-white p-xl rounded-xl border border-border-subtle hover:shadow-md transition-all flex flex-col gap-lg">
+            <h3 className="font-subhead text-lg text-text-primary">最近讨论</h3>
+
+            {recentDiscussions.length === 0 && !discussionsLoading && !discussionsError ? (
+              <div className="text-small text-text-secondary">暂无任务评论。</div>
+            ) : (
+              <div className="space-y-lg max-h-[640px] overflow-y-auto pr-1">
+                {recentDiscussions.map((row) => (
+                  <button
+                    key={row.id}
+                    type="button"
+                    className="w-full text-left flex gap-lg items-start rounded-xl p-2 -m-2 hover:bg-surface-container-lowest/80 transition-colors"
+                    onClick={() => {
+                      setTaskDrawerProjectId(row.project_id);
+                      setTaskDrawerItemId(row.item_id);
+                      setTaskDrawerHighlightId(row.id);
+                      setTaskDrawerOpen(true);
+                    }}
+                  >
+                    <div className="h-10 w-10 rounded-full bg-surface-container shrink-0 flex items-center justify-center">
+                      <span className="material-symbols-outlined text-indigo-400 text-xl">
+                        {row.is_reply ? "reply" : "chat_bubble"}
+                      </span>
+                    </div>
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <span
+                          className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                            row.is_reply ? "bg-zinc-100 text-zinc-600" : "bg-indigo-50 text-indigo-700"
+                          }`}
+                        >
+                          {row.is_reply ? "回复" : "评论"}
+                        </span>
+                        <span className="text-small font-bold text-text-primary">
+                          {row.author_display_name || "用户"}
+                        </span>
+                      </div>
+                      <p className="text-sm text-text-secondary leading-relaxed whitespace-pre-wrap break-words">
+                        {row.body}
+                      </p>
+                      <div className="text-[11px] text-zinc-500 flex flex-wrap gap-x-3 gap-y-0.5">
+                        <span>
+                          {row.is_reply ? "回复" : "评论"}时间：{formatDiscussionExact(row.created_at)}
+                        </span>
+                        <span>
+                          距今：{formatDiscussionAgo(row.created_at)}
+                        </span>
+                      </div>
+                      <div className="text-caption text-neutral-muted truncate">
+                        {row.project_name} · {row.item_title}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+
+                <div ref={discussionsSentinelRef} className="h-px" aria-hidden />
+
+                {discussionsLoading && (
+                  <div className="text-center text-caption text-neutral-muted py-2">加载中…</div>
+                )}
+                {discussionsError && (
+                  <div className="flex items-center justify-center gap-2 text-caption text-error py-2">
+                    <span>{discussionsError}</span>
+                    <button
+                      type="button"
+                      className="text-primary hover:underline"
+                      onClick={() => void loadMoreDiscussions(false)}
+                    >
+                      重试
+                    </button>
+                  </div>
+                )}
+                {!discussionsHasMore && !discussionsLoading && recentDiscussions.length > 0 && (
+                  <div className="text-center text-caption text-neutral-muted py-2">已加载全部讨论</div>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
+
+      <TaskDrawerWithComments
+        open={taskDrawerOpen}
+        onClose={() => {
+          setTaskDrawerOpen(false);
+          setTaskDrawerProjectId(null);
+          setTaskDrawerItemId(null);
+          setTaskDrawerHighlightId(null);
+        }}
+        workspaceId={workspaceId}
+        projectId={taskDrawerProjectId ?? ""}
+        itemId={taskDrawerItemId}
+        highlightCommentId={taskDrawerHighlightId}
+        token={token}
+      />
+
+      {deleteProjectOpen && deleteProjectTarget && (
+        <div className="fixed inset-0 z-50">
+          <div
+            className="absolute inset-0 bg-black/40"
+            onClick={() => {
+              if (!deletingProjectId) {
+                setDeleteProjectOpen(false);
+                setDeleteProjectTarget(null);
+              }
+            }}
+          />
+          <div className="absolute inset-0 flex items-center justify-center p-4 sm:p-6">
+            <div className="w-[min(720px,calc(100vw-2rem))] rounded-xl bg-surface border border-border-subtle p-6 space-y-5 shadow-sm max-h-[calc(100vh-6rem)] overflow-auto">
+              <div className="flex items-center justify-between">
+                <div className="font-semibold font-subhead">删除项目</div>
+                <button
+                  className="text-sm underline disabled:opacity-50"
+                  type="button"
+                  disabled={!!deletingProjectId}
+                  onClick={() => {
+                    if (!deletingProjectId) {
+                      setDeleteProjectOpen(false);
+                      setDeleteProjectTarget(null);
+                    }
+                  }}
+                >
+                  关闭
+                </button>
+              </div>
+
+              <div className="space-y-3">
+                <div className="rounded-xl border border-error-container bg-error-container/10 p-4">
+                  <div className="font-medium text-gray-900">确定要删除项目 “{deleteProjectTarget.name}” 吗？</div>
+                  <div className="text-small text-text-secondary mt-2">此操作不可恢复，项目下的任务也会一并删除。</div>
+                </div>
+
+                {deleteProjectError && <div className="text-small text-error">{deleteProjectError}</div>}
+
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    className="text-sm rounded-xl border border-border-subtle px-4 py-2 disabled:opacity-50"
+                    onClick={() => {
+                      setDeleteProjectOpen(false);
+                      setDeleteProjectTarget(null);
+                    }}
+                    disabled={!!deletingProjectId}
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    className="text-sm rounded-xl bg-red-600 text-white px-4 py-2 hover:bg-red-700 disabled:opacity-50"
+                    onClick={() => onDeleteProject(deleteProjectTarget)}
+                    disabled={deletingProjectId === deleteProjectTarget.id}
+                  >
+                    {deletingProjectId === deleteProjectTarget.id ? "删除中…" : "删除"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </main>
+  );
+}
+
